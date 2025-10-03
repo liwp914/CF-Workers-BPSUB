@@ -1,16 +1,19 @@
-const FIXED_UUID = '';// 天书13
+const FIXED_UUID = '';// 天书12
+//1. 天书版12.0重构版队列传输模式改，本版再次改变传输逻辑，大幅度提升传输稳定性，建议pages部署，这版是全功能开发者研究版，不适合小白部署
 import { connect } from 'cloudflare:sockets';
-//本脚本不支持任何苹果ios客户端
-//说明：抛弃了ed配置，不要设置/?ed=2560等任何ed，重构全部传输逻辑，去除订阅功能，自己手戳节点，支持基础反代路径传参/proxyip=，建议pages部署
-
+//////////////////////////////////////////////////////////////////////////配置区块////////////////////////////////////////////////////////////////////////
 let 反代IP = '' //反代IP或域名，反代IP端口一般情况下不用填写，如果你非要用非标反代的话，可以填'ts.hpc.tw:443'这样
 let 启用SOCKS5反代 = null //如果启用此功能，原始反代将失效，很多S5不一定支持ipv6，启用则需禁用doh查询ipv6功能
 let 启用SOCKS5全局反代 = false //选择是否启用SOCKS5全局反代，启用后所有访问都是S5的落地【无论你客户端选什么节点】，访问路径是客户端--CF--SOCKS5，当然启用此功能后延迟=CF+SOCKS5，带宽取决于SOCKS5的带宽，不再享受CF高速和随时满带宽的待遇
-let 我的SOCKS5账号 = '';//格式'账号:密码@地址:端口'，示例admin:admin@127.0.0.1:443或admin:admin@[IPV6]:443，支持无账号密码示例@127.0.0.1:443
-//////////////////////////////////////////////////////////////////////////流控配置////////////////////////////////////////////////////////////////////////
-let 启动控流机制 = false //true启动，false关闭，使用控流可降低CPU超时的概率，提升连接稳定性，适合轻度使用，日常使用应该绰绰有余
-let 传输控流大小 = 64; //单位字节，相当于分片大小
-//////////////////////////////////////////////////////////////////////////主要架构////////////////////////////////////////////////////////////////////////
+let 我的SOCKS5账号 = ''; //格式'账号:密码@地址:端口'，示例admin:admin@127.0.0.1:443或admin:admin@[IPV6]:443，支持无账号密码示例@127.0.0.1:443
+
+//////////////////////////////////////////////////////////////////////////个性化配置///////////////////////////////////////////////////////////////////////
+//以下是适合开发者研究的个性化配置，如果你是小白保持默认别动就行
+let 启用新版传输模式 = false //开启则使用队列传输方式，关闭则是原始管道流传输方式
+
+let 启动控流机制 = false //仅新版传输方式有效，选择是否启动控流机制，true启动，false关闭，使用控流可降低CPU超时的概率，提升连接稳定性，适合轻度使用，日常使用应该绰绰有余
+let 传输控流延迟 = 200; //单位毫秒，每传输2m数据暂停多少毫秒
+//////////////////////////////////////////////////////////////////////////网页入口////////////////////////////////////////////////////////////////////////
 export default {
     async fetch(访问请求) {
         if (访问请求.headers.get('Upgrade') === 'websocket') {
@@ -65,137 +68,228 @@ export default {
                 启用SOCKS5反代 = null;
             }
 
-            const [客户端, WS接口] = Object.values(new WebSocketPair());
-            WS接口.accept();
-            启动传输管道(WS接口);
-            return new Response(null, { status: 101, webSocket: 客户端 }); //一切准备就绪后，回复客户端WS连接升级成功
+            return await 升级WS请求(访问请求);
         } else {
             return new Response('Hello World!', { status: 200 });
         }
     }
 };
-async function 启动传输管道(WS接口, TCP接口) {
-    let 识别地址类型, 访问地址, 地址长度, 首包数据 = false, 首包处理完成 = null, 传输数据, 读取数据, 传输队列 = Promise.resolve(), 累计传输字节数 = 0, 开始传输时间 = performance.now();
-    try {
-        WS接口.addEventListener('message', async event => {
-            if (!首包数据) {
-                首包数据 = true;
-                首包处理完成 = 解析首包数据(event.data);
-                传输队列 = 传输队列.then(() => 首包处理完成).catch(e => { throw (e) });
-                累计传输字节数 += event.data.length;
-            } else {
-                await 首包处理完成;
-                传输队列 = 传输队列.then(() => 传输数据.write(event.data)).catch(e => { throw (e) });
-                累计传输字节数 += event.data.length;
-            }
+
+////////////////////////////////////////////////////////////////////////脚本主要架构//////////////////////////////////////////////////////////////////////
+//第一步，读取和构建基础访问结构
+async function 升级WS请求(访问请求) {
+    const 创建WS接口 = new WebSocketPair();
+    const [客户端, WS接口] = Object.values(创建WS接口);
+    WS接口.accept();
+    处理WS请求(访问请求, WS接口)
+    return new Response(null, { status: 101, webSocket: 客户端 }); //一切准备就绪后，回复客户端WS连接升级成功
+}
+async function 处理WS请求(访问请求, WS接口) {
+    let 转换二进制数据;
+    const 读取WS数据头 = 访问请求.headers.get('sec-websocket-protocol'); //读取访问标头中的WS通信数据
+    if (!读取WS数据头) {
+        转换二进制数据 = await new Promise(resolve => {
+            WS接口.addEventListener('message', event => {
+                resolve(new Uint8Array(event.data));
+            }, { once: true });
         });
-        async function 解析首包数据(首包数据) {
-            const 二进制数据 = new Uint8Array(首包数据);
-            const 版本号 = 二进制数据[0];
-            const 验证VL的密钥 = (a, i = 0) => [...a.slice(i, i + 16)].map(b => b.toString(16).padStart(2, '0')).join('').replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4-$5');
-            if (FIXED_UUID && 验证VL的密钥(二进制数据.slice(1, 17)) !== FIXED_UUID) throw new Error('UUID验证失败');
-            WS接口.send(new Uint8Array([版本号, 0]));
-            const 提取端口索引 = 18 + 二进制数据[17] + 1;
-            const 访问端口 = new DataView(二进制数据.buffer, 提取端口索引, 2).getUint16(0);
-            if (访问端口 === 53) { //这个处理是应对某些客户端优先强制查询dns的情况，通过加密通道udp over tcp的
-                const 提取DNS查询报文 = 二进制数据.slice(提取端口索引 + 9);
-                const 查询DOH结果 = await fetch('https://1.1.1.1/dns-query', {
-                    method: 'POST',
-                    headers: {
-                        'content-type': 'application/dns-message',
-                    },
-                    body: 提取DNS查询报文
-                })
-                const 提取DOH结果 = await 查询DOH结果.arrayBuffer();
-                const 构建长度头部 = new Uint8Array([(提取DOH结果.byteLength >> 8) & 0xff, 提取DOH结果.byteLength & 0xff]);
-                WS接口.send(await new Blob([构建长度头部, 提取DOH结果]));
-                return;
-            }
-            const 提取地址索引 = 提取端口索引 + 2;
-            识别地址类型 = 二进制数据[提取地址索引];
-            let 地址信息索引 = 提取地址索引 + 1;
-            switch (识别地址类型) {
-                case 1:
-                    地址长度 = 4;
-                    访问地址 = 二进制数据.slice(地址信息索引, 地址信息索引 + 地址长度).join('.');
-                    break;
-                case 2:
-                    地址长度 = 二进制数据[地址信息索引];
-                    地址信息索引 += 1;
-                    const 访问域名 = new TextDecoder().decode(二进制数据.slice(地址信息索引, 地址信息索引 + 地址长度));
-                    访问地址 = 访问域名;
-                    break;
-                case 3:
-                    地址长度 = 16;
-                    const ipv6 = [];
-                    const 读取IPV6地址 = new DataView(二进制数据.buffer, 地址信息索引, 16);
-                    for (let i = 0; i < 8; i++) ipv6.push(读取IPV6地址.getUint16(i * 2).toString(16));
-                    访问地址 = ipv6.join(':');
-                    break;
-                default:
-                    throw new Error('无效的访问地址');
-            }
-            if (访问地址.includes(atob('c3BlZWQuY2xvdWRmbGFyZS5jb20='))) throw new Error('Access');
-            if (启用SOCKS5反代 == 'socks5' && 启用SOCKS5全局反代) {
-                TCP接口 = await 创建SOCKS5接口(识别地址类型, 访问地址, 访问端口);
-            } else if (启用SOCKS5反代 == 'http' && 启用SOCKS5全局反代) {
-                TCP接口 = await httpConnect(访问地址, 访问端口);
-            } else {
-                try {
-                    if (识别地址类型 === 3) {
-                        const 转换IPV6地址 = `[${访问地址}]`
-                        TCP接口 = connect({ hostname: 转换IPV6地址, port: 访问端口 });
-                    } else {
-                        TCP接口 = connect({ hostname: 访问地址, port: 访问端口 });
-                    }
-                    await TCP接口.opened;
-                } catch {
-                    if (启用SOCKS5反代 == 'socks5') {
-                        TCP接口 = await 创建SOCKS5接口(识别地址类型, 访问地址, 访问端口);
-                    } else if (启用SOCKS5反代 == 'http') {
-                        TCP接口 = await httpConnect(访问地址, 访问端口);
-                    } else {
-                        let [反代IP地址, 反代IP端口] = 解析地址端口(反代IP);
-                        TCP接口 = connect({ hostname: 反代IP地址, port: 反代IP端口 });
-                    }
-                }
-            }
-            await TCP接口.opened;
-            传输数据 = TCP接口.writable.getWriter();
-            读取数据 = TCP接口.readable.getReader();
-            const 写入初始数据 = 二进制数据.slice(地址信息索引 + 地址长度)
-            if (写入初始数据) try { await 传输数据.write(写入初始数据) } catch (e) { throw (e) };
-            启动回传管道();
+    } else {
+        转换二进制数据 = 转换WS数据头为二进制数据(读取WS数据头); //解码目标访问数据，传递给TCP握手进程
+    }
+    解析VL标头(转换二进制数据, WS接口); //解析VL数据并进行TCP握手
+}
+function 转换WS数据头为二进制数据(WS数据头) {
+    const base64URL转换为标准base64 = WS数据头.replace(/-/g, '+').replace(/_/g, '/');
+    const 解码base64 = atob(base64URL转换为标准base64);
+    const 转换为二进制数组 = Uint8Array.from(解码base64, c => c.charCodeAt(0));
+    return 转换为二进制数组;
+}
+//第二步，解读VL协议数据，创建TCP握手
+async function 解析VL标头(二进制数据, WS接口, TCP接口) {
+    let 识别地址类型, 访问地址, 地址长度;
+    try {
+        const 版本号 = 二进制数据[0];
+        WS接口.send(new Uint8Array([版本号, 0]));
+        const 获取数据定位 = 二进制数据[17];
+        const 提取端口索引 = 18 + 获取数据定位 + 1;
+        const 访问端口 = new DataView(二进制数据.buffer, 提取端口索引, 2).getUint16(0);
+        if (访问端口 === 53) { //这个处理是应对某些客户端优先强制查询dns的情况，也是通过加密通道udp over tcp的，放心使用
+            const 提取DNS查询报文 = 二进制数据.slice(提取端口索引 + 9);
+            const 查询DOH结果 = await fetch('https://1.1.1.1/dns-query', { //不是所有doh都支持二进制查询，默认的是最快的地址，想更换可以换成"https://dns.google/dns-query"
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/dns-message',
+                },
+                body: 提取DNS查询报文
+            })
+            const 提取DOH结果 = await 查询DOH结果.arrayBuffer();
+            const 构建长度头部 = new Uint8Array([(提取DOH结果.byteLength >> 8) & 0xff, 提取DOH结果.byteLength & 0xff]);
+            WS接口.send(await new Blob([构建长度头部, 提取DOH结果, new TextEncoder().encode(生成随机字符串())]).arrayBuffer());
+            return;
         }
-        async function 启动回传管道() {
-            while (true) {
-                await 传输队列;
-                const { done: 流结束, value: 返回数据 } = await 读取数据.read();
-                if (返回数据 && 返回数据.length > 0) {
-                    if (启动控流机制) {
-                        let 分段初值 = 0
-                        let 分段大小 = 传输控流大小;
-                        while (分段初值 < 返回数据.length) {
-                            const 数据块 = 返回数据.slice(分段初值, 分段初值 + 分段大小);
-                            传输队列 = 传输队列.then(() => WS接口.send(数据块)).catch(e => { throw (e) });
-                            分段初值 += 分段大小;
-                        }
-                    } else {
-                        传输队列 = 传输队列.then(() => WS接口.send(返回数据)).catch(e => { throw (e) });
-                    }
+        const 提取地址索引 = 提取端口索引 + 2;
+        识别地址类型 = 二进制数据[提取地址索引];
+        let 地址信息索引 = 提取地址索引 + 1;
+        switch (识别地址类型) {
+            case 1:
+                地址长度 = 4;
+                访问地址 = 二进制数据.slice(地址信息索引, 地址信息索引 + 地址长度).join('.');
+                break;
+            case 2:
+                地址长度 = 二进制数据[地址信息索引];
+                地址信息索引 += 1;
+                访问地址 = new TextDecoder().decode(二进制数据.slice(地址信息索引, 地址信息索引 + 地址长度));
+                break;
+            case 3:
+                地址长度 = 16;
+                const ipv6 = [];
+                const 读取IPV6地址 = new DataView(二进制数据.buffer, 地址信息索引, 16);
+                for (let i = 0; i < 8; i++) ipv6.push(读取IPV6地址.getUint16(i * 2).toString(16));
+                访问地址 = ipv6.join(':');
+                break;
+            default:
+                throw new Error('无效的访问地址');
+        }
+        if (FIXED_UUID && 验证VL的密钥(二进制数据.slice(1, 17)) !== FIXED_UUID) throw new Error('UUID验证失败');
+        if (访问地址.includes(atob('c3BlZWQuY2xvdWRmbGFyZS5jb20='))) throw new Error('Access');
+        if (启用SOCKS5反代 == 'socks5' && 启用SOCKS5全局反代) {
+            TCP接口 = await 创建SOCKS5接口(识别地址类型, 访问地址, 访问端口);
+        } else if (启用SOCKS5反代 == 'http' && 启用SOCKS5全局反代) {
+            TCP接口 = await httpConnect(访问地址, 访问端口);
+        } else {
+            try {
+                if (识别地址类型 === 3) {
+                    const 转换IPV6地址 = `[${访问地址}]`
+                    TCP接口 = connect({ hostname: 转换IPV6地址, port: 访问端口 });
+                } else {
+                    TCP接口 = connect({ hostname: 访问地址, port: 访问端口 });
                 }
-                累计传输字节数 += 返回数据.length;
-                if (流结束) break;
+                await TCP接口.opened;
+            } catch {
+                if (启用SOCKS5反代 == 'socks5') {
+                    TCP接口 = await 创建SOCKS5接口(识别地址类型, 访问地址, 访问端口);
+                } else if (启用SOCKS5反代 == 'http') {
+                    TCP接口 = await httpConnect(访问地址, 访问端口);
+                } else {
+                    let [反代IP地址, 反代IP端口] = 解析地址端口(反代IP);
+                    TCP接口 = connect({ hostname: 反代IP地址, port: 反代IP端口 });
+                }
             }
-            throw new Error('传输完成');
+        }
+        await TCP接口.opened;
+        const 写入初始数据 = 二进制数据.slice(地址信息索引 + 地址长度)
+        const 传输数据 = TCP接口.writable.getWriter();
+        if (写入初始数据.length > 0) {
+            await 传输数据.write(写入初始数据);
+        }
+        if (启用新版传输模式) {
+            const 读取数据 = TCP接口.readable.getReader();
+            队列传输管道(访问地址, 传输数据, 读取数据, WS接口); //建立WS接口与TCP接口的传输管道
+        } else {
+            原始传输管道(传输数据, TCP接口, WS接口)
         }
     } catch (e) {
-        try { await TCP接口.close?.() } catch { };
-        WS接口.close?.();
+        return new Response(`连接握手失败: ${e}`, { status: 500 });
     }
+}
+function 验证VL的密钥(字节数组, 起始位置 = 0) {
+    const 十六进制表 = Array.from({ length: 256 }, (_, 值) =>
+        (值 + 256).toString(16).slice(1)
+    );
+    const 分段结构 = [4, 2, 2, 2, 6];
+    let 当前索引 = 起始位置;
+    const 格式化UUID = 分段结构
+        .map(段长度 =>
+            Array.from({ length: 段长度 }, () => 十六进制表[字节数组[当前索引++]]).join('')
+        )
+        .join('-')
+        .toLowerCase();
+    return 格式化UUID;
 }
 
 globalThis.DNS缓存记录 = globalThis.DNS缓存记录 ??= new Map();
+
+function 解析地址端口(反代IP) {
+    const proxyIP = 反代IP.toLowerCase();
+    let 地址 = proxyIP, 端口 = 443;
+    if (!proxyIP || proxyIP == '') {
+        地址 = 'proxyip.fxxk.dedyn.io'; //默认反代
+    } else if (proxyIP.includes(']:')) {
+        端口 = proxyIP.split(']:')[1] || 端口;
+        地址 = proxyIP.split(']:')[0] + "]" || 地址;
+    } else if (proxyIP.split(':').length === 2) {
+        端口 = proxyIP.split(':')[1] || 端口;
+        地址 = proxyIP.split(':')[0] || 地址;
+    }
+    if (proxyIP.includes('.tp')) 端口 = proxyIP.split('.tp')[1].split('.')[0] || 端口;
+    return [地址, 端口];
+}
+//第三步，创建客户端WS-CF-目标的传输通道并监听状态
+async function 原始传输管道(传输数据, TCP接口, WS接口) {
+    WS接口.addEventListener('message', async event => { try { await 传输数据.write(new Uint8Array(event.data)) } catch { }; }); //监听客户端WS接口后续数据，推送给TCP接口
+    TCP接口.readable.pipeTo(new WritableStream({ async write(返回数据) { WS接口.send(返回数据) } })); //将TCP接口返回的数据回写至客户端WS接口
+}
+async function 队列传输管道(访问地址, 传输数据, 读取数据, WS接口, 传输队列 = Promise.resolve(), 开始传输时间 = performance.now(), 字节计数 = 0, 累计传输字节数 = 0, 大数据包 = false, 已结束 = false) {
+    WS接口.addEventListener('message', event => 传输队列 = 传输队列.then(async () => {
+        let 分段初值 = 0
+        let 分段大小 = 4 * 1024;
+        const WS数据 = new Uint8Array(event.data);
+        while (分段初值 < WS数据.length) {
+            const 数据块 = WS数据.slice(分段初值, 分段初值 + 分段大小);
+            try { await 传输数据.write(数据块) } catch { };
+            累计传输字节数 += 数据块.length;
+            分段初值 += 分段大小;
+        }
+        累计传输字节数 += WS数据.length;
+    }).catch());
+    const 保活 = setInterval(async () => {
+        if (已结束) {
+            clearInterval(保活);
+        } else {
+            传输队列 = 传输队列.then(async () => await 传输数据.write(new Uint8Array(0))).catch();
+        }
+    }, 30000);
+    while (true) {
+        const { done: 流结束, value: 返回数据 } = await 读取数据.read();
+        if (返回数据 && 返回数据.length > 0) {
+            if (!大数据包 && 返回数据.length >= 4096) {
+                let TCP缓存 = [];
+                let TCP缓存长度 = 0;
+                大数据包 = true;
+                TCP缓存.push(返回数据);
+                TCP缓存长度 += 返回数据.length;
+                while (true) {
+                    const { done: 流结束, value: 返回数据 } = await 读取数据.read();
+                    if (流结束) 已结束 = true;
+                    if (返回数据 && 返回数据.length > 0) {
+                        TCP缓存.push(返回数据);
+                        TCP缓存长度 += 返回数据.length;
+                        if (返回数据.length < 4096 || TCP缓存长度 >= 512 * 1024) {
+                            let 合并偏移 = 0;
+                            let 待推送数据 = new Uint8Array(TCP缓存长度);
+                            for (const 数据块 of TCP缓存) {
+                                待推送数据.set(数据块, 合并偏移);
+                                合并偏移 += 数据块.length;
+                            }
+                            传输队列 = 传输队列.then(() => WS接口.send(待推送数据)).catch();
+                            累计传输字节数 += 待推送数据.length;
+                            大数据包 = false;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                传输队列 = 传输队列.then(() => WS接口.send(返回数据)).catch();
+                累计传输字节数 += 返回数据.length;
+            }
+            if (启动控流机制 && (累计传输字节数 - 字节计数) > 2 * 1024 * 1024) {
+                传输队列 = 传输队列.then(async () => await new Promise(resolve => setTimeout(resolve, 传输控流延迟))).catch();
+                字节计数 = 累计传输字节数;
+            }
+        }
+        if (流结束 || 已结束) { 已结束 = true; break; }
+    }
+}
 //////////////////////////////////////////////////////////////////////////SOCKS5部分//////////////////////////////////////////////////////////////////////
 async function 创建SOCKS5接口(识别地址类型, 访问地址, 访问端口, 转换访问地址, 传输数据, 读取数据) {
     let SOCKS5接口, 账号, 密码, 地址, 端口;
@@ -257,7 +351,6 @@ async function 创建SOCKS5接口(识别地址类型, 访问地址, 访问端口
         读取数据.releaseLock();
         return SOCKS5接口;
     } catch { };
-
     传输数据?.releaseLock();
     读取数据?.releaseLock();
     await SOCKS5接口?.close();
@@ -314,21 +407,21 @@ async function 获取SOCKS5账号(address) {
         port,	 // 端口号，已转换为数字类型
     }
 }
-function 解析地址端口(反代IP) {
-    const proxyIP = 反代IP.toLowerCase();
-    let 地址 = proxyIP, 端口 = 443;
-    if (!proxyIP || proxyIP == '') {
-        地址 = 'proxyip.fxxk.dedyn.io'; //默认反代
-    } else if (proxyIP.includes(']:')) {
-        端口 = proxyIP.split(']:')[1] || 端口;
-        地址 = proxyIP.split(']:')[0] + "]" || 地址;
-    } else if (proxyIP.split(':').length === 2) {
-        端口 = proxyIP.split(':')[1] || 端口;
-        地址 = proxyIP.split(':')[0] || 地址;
+//////////////////////////////////////////////////////////////////////////订阅页面////////////////////////////////////////////////////////////////////////
+
+function 生成随机字符串(最小长度 = 8, 最大长度 = 24) {
+    const 字符集 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    const 长度 = 最小长度 + Math.floor(Math.random() * (最大长度 - 最小长度 + 1));
+    const 结果 = [];
+    const 随机字节 = new Uint8Array(长度);
+    crypto.getRandomValues(随机字节);
+    for (let i = 0; i < 长度; i++) {
+        const 随机索引 = 随机字节[i] % 字符集.length;
+        结果.push(字符集[随机索引]);
     }
-    if (proxyIP.includes('.tp')) 端口 = proxyIP.split('.tp')[1].split('.')[0] || 端口;
-    return [地址, 端口];
+    return 结果.join('');
 }
+
 async function httpConnect(addressRemote, portRemote) {
     const parsedSocks5Address = await 获取SOCKS5账号(我的SOCKS5账号);
     const { username, password, hostname, port } = parsedSocks5Address;
